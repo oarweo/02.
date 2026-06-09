@@ -4,7 +4,8 @@ const { Server } = require('socket.io');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
-const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -15,132 +16,107 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// База данных в памяти для тестов Hokuo
+// Создаем папку для вечного хранения файлов прямо внутри сервера
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) {
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
+// Делаем папку uploads публичной, чтобы файлы открывались по прямым ссылкам
+app.use('/uploads', express.static(UPLOAD_DIR));
+
+// База данных в оперативной памяти для мессенджера Hokuo
 const users = new Map(); 
 const blacklists = new Map(); 
 const onlineUsers = new Map(); 
 
-const megaEmail = process.env.MEGA_EMAIL;
-const megaPassword = process.env.MEGA_PASSWORD;
-let isMegaReady = false;
-
-// Прямая авторизация через официальный HTTP API сервер MEGA (Без библиотек и сторонних утилит)
-async function loginToMegaAPI() {
-    if (!megaEmail || !megaPassword) {
-        console.warn('⚠️ Переменные MEGA_EMAIL или MEGA_PASSWORD не заданы в Environment на Render');
-        return;
+// Настройка Multer для сохранения файлов на локальный диск сервера
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        cb(null, UPLOAD_DIR);
+    },
+    filename: (req, file, cb) => {
+        // Создаем уникальное имя файла, убирая пробелы и спецсимволы
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        const safeName = file.originalname.replace(/[^a-zA-Z0-9.]/g, "_");
+        cb(null, uniqueSuffix + '_' + safeName);
     }
-
-    try {
-        console.log('🔄 Отправляем прямой сетевой запрос авторизации в API MEGA...');
-        
-        // Хешируем пароль по правилам криптографии MEGA API
-        const passwordHash = crypto.createHash('sha256').update(megaPassword).digest('base64');
-
-        const response = await fetch('https://mega.co.nz', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify([{
-                a: 'us', // действие: личный вход
-                user: megaEmail,
-                password: passwordHash
-            }])
-        });
-
-        if (!response.ok) throw new Error(`HTTP Error ${response.status}`);
-        
-        const data = await response.json();
-        
-        // Проверяем, вернула ли MEGA ошибку (отрицательные числа в API MEGA означают коды ошибок)
-        if (typeof data === 'number' || (Array.isArray(data) && typeof data[0] === 'number')) {
-            const errorCode = Array.isArray(data) ? data[0] : data;
-            console.error(`❌ Сетевой API MEGA отклонил данные. Код ошибки: ${errorCode}. Проверьте правильность почты и пароля в настройках Render.`);
-            isMegaReady = false;
-        } else {
-            console.log('✅ Успешное прямое сетевое подключение к API облака MEGA!');
-            isMegaReady = true;
-        }
-    } catch (apiError) {
-        console.error('❌ Ошибка сети при попытке связаться с API MEGA:', apiError.message);
-        isMegaReady = false;
-    }
-}
-
-// Запускаем сетевой вход при старте сервера
-loginToMegaAPI();
-
-// Настройка Multer для приема файлов в буфер памяти
-const upload = multer({ storage: multer.memoryStorage() });
+});
+const upload = multer({ storage: storage });
 
 // --- МАРШРУТЫ (HTTP ENDPOINTS) ---
 
+// Проверка статуса сервера через браузер
 app.get('/', (req, res) => {
+    // Автоматически определяем текущий адрес сервера в интернете
+    const protocol = req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    const host = req.get('host');
+    const baseUrl = `${protocol}://${host}`;
+
     res.json({
         status: "ok",
-        message: "🚀 Сервер мессенджера Hokuo работает",
-        storage: isMegaReady ? "✅ MEGA успешно подключена напрямую через HTTP API" : "❌ MEGA не настроена (неверные данные авторизации)",
+        message: "🚀 Сервер мессенджера Hokuo успешно работает!",
+        storage: "✅ Локальное хранилище сервера активировано (Файлы сохраняются внутри Render)",
+        upload_endpoint: `${baseUrl}/upload`,
         timestamp: new Date().toISOString()
     });
 });
 
-// Маршрут регистрации
+// Рабочий маршрут регистрации (Убирает ошибку 404 в приложении)
 app.post('/register', async (req, res) => {
     const { username, password, hokuo_id } = req.body;
-    if (!username || !password || !hokuo_id) return res.status(400).json({ error: "Заполните все поля" });
-    if (users.has(hokuo_id)) return res.status(400).json({ error: "Этот Hokuo ID уже занят" });
+    
+    if (!username || !password || !hokuo_id) {
+        return res.status(400).json({ error: "Заполните все поля" });
+    }
+
+    if (users.has(hokuo_id)) {
+        return res.status(400).json({ error: "Этот Hokuo ID уже занят" });
+    }
 
     const hashedPassword = await bcrypt.hash(password, 10);
     users.set(hokuo_id, { username, password_hash: hashedPassword, hokuo_id });
     blacklists.set(hokuo_id, new Set());
+
     res.status(201).json({ status: "success", message: "Пользователь зарегистрирован", hokuo_id });
 });
 
-// Маршрут авторизации
+// Маршрут входа (Авторизация)
 app.post('/login', async (req, res) => {
     const { hokuo_id, password } = req.body;
+    
     const user = users.get(hokuo_id);
-    if (!user) return res.status(404).json({ error: "Пользователь не найден" });
+    if (!user) {
+        return res.status(404).json({ error: "Пользователь не найден" });
+    }
 
     const validPassword = await bcrypt.compare(password, user.password_hash);
-    if (!validPassword) return res.status(401).json({ error: "Неверный пароль" });
+    if (!validPassword) {
+        return res.status(401).json({ error: "Неверный пароль" });
+    }
 
     res.json({ status: "success", token: "session-token-hokuo", username: user.username, hokuo_id });
 });
 
-// Загрузка файлов напрямую в MEGA через API запрос
-app.post('/upload', upload.single('file'), async (req, res) => {
-    if (!isMegaReady) return res.status(503).json({ error: "Облако MEGA сейчас недоступно" });
-    if (!req.file) return res.status(400).json({ error: "Файл не отправлен" });
-
-    try {
-        const remoteFileName = `${Date.now()}_${req.file.originalname}`;
-        
-        // Отправляем файл бинарным HTTP-потоком прямо на upload-сервер MEGA API
-        const uploadResponse = await fetch(`https://mega.co.nz?id=${Math.floor(Math.random() * 1000000)}&ak=hokuoMessenger`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/octet-stream',
-                'X-MEGA-Filename': encodeURIComponent(remoteFileName)
-            },
-            body: req.file.buffer
-        });
-
-        if (!uploadResponse.ok) throw new Error("MEGA API Upload Rejected");
-
-        const uploadResult = await uploadResponse.json();
-        
-        // Формируем прямую ссылку на файл
-        const fileUrl = `https://mega.nz{Date.now()}`;
-
-        res.json({ url: fileUrl });
-    } catch (uploadErr) {
-        console.error('Ошибка загрузки файла по HTTP API:', uploadErr.message);
-        res.status(500).json({ error: "Не удалось сохранить файл в MEGA через API" });
+// Загрузка картинок и файлов напрямую на сервер Render без внешних блокировок
+app.post('/upload', upload.single('file'), (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: "Файл не отправлен" });
     }
+
+    // Формируем прямую рабочуть ссылку на файл в интернете
+    const protocol = req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
+    const host = req.get('host');
+    const fileUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
+
+    // Возвращаем приложению готовую ссылку на изображение
+    res.json({ url: fileUrl });
 });
 
 // --- ЛОГИКА ЧАТА (WEBSOCKETS) ---
 io.on('connection', (socket) => {
+    console.log('Пользователь подключился к Hokuo:', socket.id);
+
     socket.on('userOnline', (hokuo_id) => {
         onlineUsers.set(socket.id, hokuo_id);
         io.emit('statusChanged', { hokuo_id, status: "online" });
@@ -149,7 +125,11 @@ io.on('connection', (socket) => {
     socket.on('sendMessage', (data) => {
         const { sender_id, recipient_id } = data;
         const recipientBlacklist = blacklists.get(recipient_id);
-        if (recipientBlacklist && recipientBlacklist.has(sender_id)) return;
+        
+        if (recipientBlacklist && recipientBlacklist.has(sender_id)) {
+            return socket.emit('error', { message: "Вы заблокированы этим пользователем" });
+        }
+
         io.emit('newMessage', data);
     });
 
@@ -172,5 +152,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-    console.log(`Сервер Hokuo успешно запущен на порту ${PORT}`);
+    console.log(`Сервер Hokuo запущен на порту ${PORT}`);
 });
