@@ -16,54 +16,43 @@ const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Создаем папку для вечного хранения файлов прямо внутри сервера
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
-
-// Делаем папку uploads публичной, чтобы файлы открывались по прямым ссылкам
 app.use('/uploads', express.static(UPLOAD_DIR));
 
-// База данных в оперативной памяти для мессенджера Hokuo
+// База данных в оперативной памяти (сбросится при перезапуске сервера)
 const users = new Map(); 
 const blacklists = new Map(); 
 const onlineUsers = new Map(); 
 
-// Настройка Multer для сохранения файлов на локальный диск сервера
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, UPLOAD_DIR);
-    },
+    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
     filename: (req, file, cb) => {
-        // Создаем уникальное имя файла, убирая пробелы и спецсимволы
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        const safeName = file.originalname.replace(/[^a-zA-Z0-9.]/g, "_");
-        cb(null, uniqueSuffix + '_' + safeName);
+        cb(null, uniqueSuffix + '_' + file.originalname.replace(/[^a-zA-Z0-9.]/g, "_"));
     }
 });
 const upload = multer({ storage: storage });
 
-// --- МАРШРУТЫ (HTTP ENDPOINTS) ---
-
-// Проверка статуса сервера через браузер
+// --- ПРОВЕРКА ВСЕХ ПУТЕЙ ДЛЯ ТЕБЯ ---
+// Теперь при заходе на https://zero2-7gya.onrender.com ты увидишь, что пути ЕСТЬ!
 app.get('/', (req, res) => {
-    // Автоматически определяем текущий адрес сервера в интернете
-    const protocol = req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
-    const host = req.get('host');
-    const baseUrl = `${protocol}://${host}`;
-
     res.json({
-        status: "ok",
-        message: "🚀 Сервер мессенджера Hokuo успешно работает!",
-        storage: "✅ Локальное хранилище сервера активировано (Файлы сохраняются внутри Render)",
-        upload_endpoint: `${baseUrl}/upload`,
-        timestamp: new Date().toISOString()
+        status: "working",
+        message: "🚀 Сервер Hokuo успешно запущен!",
+        available_endpoints: {
+            registration: "POST /register",
+            login: "POST /login",
+            upload_files: "POST /upload"
+        }
     });
 });
 
-// Рабочий маршрут регистрации (Убирает ошибку 404 в приложении)
+// КРИТИЧЕСКИЙ МАРШРУТ РЕГИСТРАЦИИ
 app.post('/register', async (req, res) => {
+    console.log('=== ЗАПРОС НА РЕГИСТРАЦИЮ ===', req.body);
     const { username, password, hokuo_id } = req.body;
     
     if (!username || !password || !hokuo_id) {
@@ -78,11 +67,13 @@ app.post('/register', async (req, res) => {
     users.set(hokuo_id, { username, password_hash: hashedPassword, hokuo_id });
     blacklists.set(hokuo_id, new Set());
 
+    console.log(`✅ Пользователь ${username} (${hokuo_id}) успешно сохранен в базу!`);
     res.status(201).json({ status: "success", message: "Пользователь зарегистрирован", hokuo_id });
 });
 
-// Маршрут входа (Авторизация)
+// КРИТИЧЕСКИЙ МАРШРУТ ВХОДА
 app.post('/login', async (req, res) => {
+    console.log('=== ЗАПРОС НА ВХОД ===', req.body);
     const { hokuo_id, password } = req.body;
     
     const user = users.get(hokuo_id);
@@ -98,49 +89,24 @@ app.post('/login', async (req, res) => {
     res.json({ status: "success", token: "session-token-hokuo", username: user.username, hokuo_id });
 });
 
-// Загрузка картинок и файлов напрямую на сервер Render без внешних блокировок
 app.post('/upload', upload.single('file'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).json({ error: "Файл не отправлен" });
-    }
-
-    // Формируем прямую рабочуть ссылку на файл в интернете
+    if (!req.file) return res.status(400).json({ error: "Файл не отправлен" });
     const protocol = req.secure || req.headers['x-forwarded-proto'] === 'https' ? 'https' : 'http';
-    const host = req.get('host');
-    const fileUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
-
-    // Возвращаем приложению готовую ссылку на изображение
+    const fileUrl = `${protocol}://${req.get('host')}/uploads/${req.file.filename}`;
     res.json({ url: fileUrl });
 });
 
-// --- ЛОГИКА ЧАТА (WEBSOCKETS) ---
 io.on('connection', (socket) => {
-    console.log('Пользователь подключился к Hokuo:', socket.id);
-
     socket.on('userOnline', (hokuo_id) => {
         onlineUsers.set(socket.id, hokuo_id);
         io.emit('statusChanged', { hokuo_id, status: "online" });
     });
-
     socket.on('sendMessage', (data) => {
         const { sender_id, recipient_id } = data;
         const recipientBlacklist = blacklists.get(recipient_id);
-        
-        if (recipientBlacklist && recipientBlacklist.has(sender_id)) {
-            return socket.emit('error', { message: "Вы заблокированы этим пользователем" });
-        }
-
+        if (recipientBlacklist && recipientBlacklist.has(sender_id)) return;
         io.emit('newMessage', data);
     });
-
-    socket.on('blockUser', ({ my_id, block_id }) => {
-        const myBlacklist = blacklists.get(my_id);
-        if (myBlacklist) {
-            myBlacklist.add(block_id);
-            socket.emit('blockedStatus', { target_id: block_id, isBlocked: true });
-        }
-    });
-
     socket.on('disconnect', () => {
         const hokuo_id = onlineUsers.get(socket.id);
         if (hokuo_id) {
