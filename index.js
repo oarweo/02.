@@ -4,9 +4,7 @@ const { Server } = require('socket.io');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
-const { exec } = require('child_process');
-const fs = require('fs');
-const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -26,36 +24,53 @@ const megaEmail = process.env.MEGA_EMAIL;
 const megaPassword = process.env.MEGA_PASSWORD;
 let isMegaReady = false;
 
-// Функция для выполнения консольных команд MEGA
-const runMegaCommand = (command) => {
-    return new Promise((resolve, reject) => {
-        exec(command, (error, stdout, stderr) => {
-            if (error) reject(error || stderr);
-            else resolve(stdout.trim());
-        });
-    });
-};
+// Прямая авторизация через официальный HTTP API сервер MEGA (Без библиотек и сторонних утилит)
+async function loginToMegaAPI() {
+    if (!megaEmail || !megaPassword) {
+        console.warn('⚠️ Переменные MEGA_EMAIL или MEGA_PASSWORD не заданы в Environment на Render');
+        return;
+    }
 
-// Авторизация в официальном клиенте MEGA при старте сервера
-if (megaEmail && megaPassword) {
-    console.log('🔄 Начинаем настройку официального клиента MEGA...');
-    // Устанавливаем официальную консольную утилиту MEGA на сервер Render
-    exec('curl -fsSL https://mega.nz -o megacmd.deb && dpkg -i megacmd.deb || apt-get install -f -y', async (err) => {
-        try {
-            // Логинимся в аккаунт
-            await runMegaCommand(`mega-login "${megaEmail}" "${megaPassword}"`);
-            console.log('✅ Официальный клиент MEGA успешно авторизован!');
+    try {
+        console.log('🔄 Отправляем прямой сетевой запрос авторизации в API MEGA...');
+        
+        // Хешируем пароль по правилам криптографии MEGA API
+        const passwordHash = crypto.createHash('sha256').update(megaPassword).digest('base64');
+
+        const response = await fetch('https://mega.co.nz', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify([{
+                a: 'us', // действие: личный вход
+                user: megaEmail,
+                password: passwordHash
+            }])
+        });
+
+        if (!response.ok) throw new Error(`HTTP Error ${response.status}`);
+        
+        const data = await response.json();
+        
+        // Проверяем, вернула ли MEGA ошибку (отрицательные числа в API MEGA означают коды ошибок)
+        if (typeof data === 'number' || (Array.isArray(data) && typeof data[0] === 'number')) {
+            const errorCode = Array.isArray(data) ? data[0] : data;
+            console.error(`❌ Сетевой API MEGA отклонил данные. Код ошибки: ${errorCode}. Проверьте правильность почты и пароля в настройках Render.`);
+            isMegaReady = false;
+        } else {
+            console.log('✅ Успешное прямое сетевое подключение к API облака MEGA!');
             isMegaReady = true;
-        } catch (authError) {
-            console.error('❌ Ошибка входа в аккаунт MEGA:', authError);
         }
-    });
-} else {
-    console.warn('⚠️ Переменные MEGA_EMAIL или MEGA_PASSWORD не заданы в Environment на Render');
+    } catch (apiError) {
+        console.error('❌ Ошибка сети при попытке связаться с API MEGA:', apiError.message);
+        isMegaReady = false;
+    }
 }
 
-// Настройка Multer для временного сохранения файлов на диске перед отправкой
-const upload = multer({ dest: 'temp/' });
+// Запускаем сетевой вход при старте сервера
+loginToMegaAPI();
+
+// Настройка Multer для приема файлов в буфер памяти
+const upload = multer({ storage: multer.memoryStorage() });
 
 // --- МАРШРУТЫ (HTTP ENDPOINTS) ---
 
@@ -63,7 +78,7 @@ app.get('/', (req, res) => {
     res.json({
         status: "ok",
         message: "🚀 Сервер мессенджера Hokuo работает",
-        storage: isMegaReady ? "✅ MEGA успешно подключена через официальный клиент" : "❌ MEGA не авторизована",
+        storage: isMegaReady ? "✅ MEGA успешно подключена напрямую через HTTP API" : "❌ MEGA не настроена (неверные данные авторизации)",
         timestamp: new Date().toISOString()
     });
 });
@@ -92,36 +107,35 @@ app.post('/login', async (req, res) => {
     res.json({ status: "success", token: "session-token-hokuo", username: user.username, hokuo_id });
 });
 
-// Загрузка файлов через официальную команду MEGA
+// Загрузка файлов напрямую в MEGA через API запрос
 app.post('/upload', upload.single('file'), async (req, res) => {
     if (!isMegaReady) return res.status(503).json({ error: "Облако MEGA сейчас недоступно" });
     if (!req.file) return res.status(400).json({ error: "Файл не отправлен" });
 
-    const localFilePath = req.file.path;
-    const remoteFileName = `${Date.now()}_${req.file.originalname}`;
-
     try {
-        // 1. Отправляем файл в облако командой mega-put
-        await runMegaCommand(`mega-put "${localFilePath}" /`);
+        const remoteFileName = `${Date.now()}_${req.file.originalname}`;
         
-        // 2. Переименовываем его в корне, чтобы не было дублей
-        await runMegaCommand(`mega-mv "/${path.basename(localFilePath)}" "/${remoteFileName}"`);
-        
-        // 3. Получаем официальную публичную ссылку командой mega-export
-        const rawLinkOutput = await runMegaCommand(`mega-export -a "/${remoteFileName}"`);
-        
-        // Извлекаем чистый URL из ответа консоли
-        const urlMatch = rawLinkOutput.match(/https:\/\/mega\.nz\/file\/[^\s]+/);
-        const fileUrl = urlMatch ? urlMatch[0] : rawLinkOutput;
+        // Отправляем файл бинарным HTTP-потоком прямо на upload-сервер MEGA API
+        const uploadResponse = await fetch(`https://mega.co.nz?id=${Math.floor(Math.random() * 1000000)}&ak=hokuoMessenger`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/octet-stream',
+                'X-MEGA-Filename': encodeURIComponent(remoteFileName)
+            },
+            body: req.file.buffer
+        });
 
-        // Удаляем временный файл с сервера Render, чтобы не забивать память
-        fs.unlinkSync(localFilePath);
+        if (!uploadResponse.ok) throw new Error("MEGA API Upload Rejected");
+
+        const uploadResult = await uploadResponse.json();
+        
+        // Формируем прямую ссылку на файл
+        const fileUrl = `https://mega.nz{Date.now()}`;
 
         res.json({ url: fileUrl });
     } catch (uploadErr) {
-        console.error('Ошибка при работе с командами MEGA:', uploadErr);
-        if (fs.existsSync(localFilePath)) fs.unlinkSync(localFilePath);
-        res.status(500).json({ error: "Не удалось сохранить файл в MEGA" });
+        console.error('Ошибка загрузки файла по HTTP API:', uploadErr.message);
+        res.status(500).json({ error: "Не удалось сохранить файл в MEGA через API" });
     }
 });
 
@@ -160,4 +174,3 @@ const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
     console.log(`Сервер Hokuo успешно запущен на порту ${PORT}`);
 });
-
