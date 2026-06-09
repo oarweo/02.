@@ -2,7 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const multer = require('multer');
-const { Storage } = require('mega-js');
+const mega = require('mega');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
 
@@ -22,25 +22,18 @@ const blacklists = new Map(); // user_id -> Set of blocked user_ids
 const onlineUsers = new Map(); // socket.id -> hokuo_id
 
 // --- НАСТРОЙКА ХРАНИЛИЩА MEGA ---
-let megaStorage = null;
-const megaEmail = process.env.MEGA_EMAIL;
-const megaPassword = process.env.MEGA_PASSWORD;
-
-if (megaEmail && megaPassword) {
-    megaStorage = new Storage({
+    megaStorage = mega({
         email: megaEmail,
         password: megaPassword
     }, (err) => {
         if (err) {
-            console.error('Ошибка авторизации в MEGA:', err.message);
+            console.error('Ошибка авторизации in MEGA:', err.message);
             megaStorage = null;
         } else {
             console.log('✅ Успешное подключение к облаку MEGA');
         }
     });
-} else {
-    console.warn('⚠️ Переменные MEGA_EMAIL или MEGA_PASSWORD не заданы на Render');
-}
+
 
 // Настройка Multer для приема файлов в память сервера
 const upload = multer({ storage: multer.memoryStorage() });
